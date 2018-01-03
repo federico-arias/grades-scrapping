@@ -5,17 +5,19 @@ import hashlib
 import re as regex
 from time import sleep
 import csv
+import os
 
 user = "16978232"
 # GET home page
 home_url = "https://cuentas.napsis.cl/index.phtml"
 response = r.get(home_url)
+password = os.environ['PASS']
 
 # POST credentials to select roles
 auth_url = "https://cuentas.napsis.cl/session/roles"
 session_id = response.cookies["PHPSESSID"]
 cookies = {"PHPSESSID": session_id}
-data = {"username":user, "password":"hola1234", "iframe":"0", "negarNapsis":""}
+data = {"username":user, "password":password, "iframe":"0", "negarNapsis":""}
 auth_response = r.post(auth_url, data = data , cookies = cookies, allow_redirects = False)
 
 sleep(5)
@@ -66,7 +68,7 @@ sleep(5)
 #r.post(report_url, data={"fAsignatura":"TODAS"}, cookies=auth_cookie)
 # request report 
 #sleep(5)
-report_form_data = {"fNivel":"2", "fReligion":"3", "fAsignatura":"TODAS", "fperiodos":"TODAS", "fDecimales":"1", "fMostrarDetalleMadres":"1", "fMostrarRunAlumno":"1", "fAjustarnAsignatura":"1", "fMostrarProfAsig":"1"}
+report_form_data = {"fNivel":"2", "fReligion":"3", "fAsignatura":"TODAS", "fperiodos":"TODAS", "fDecimales":"1", "fMostrarRunAlumno":"1", "fAjustarnAsignatura":"1", "fMostrarProfAsig":"1"}
 report_request = r.post(report_url, data=report_form_data, cookies=auth_cookie)
 
 # with open("report.html", "w") as f:
@@ -76,35 +78,58 @@ base_web = BeautifulSoup(report_request.content, "lxml")
 # get all the years available
 years = base_web.find("select", attrs={"id":"fAnoEscolar"}).findAll("option")
 years = [x['value'] for x in years]
+#years_name = [x.text.strip() for x in years]
 # get all the educational stages (middle, high) available
 stages = base_web.find("select", attrs={"id":"fTipoEns"}).findAll("option")
-stages = [x['value'] for x in stages if x['value'] is not '']
+stages = [x for x in stages if type(x) == bs4.element.Tag and x['value'] !=  '' and x['value'] != '10']
 
-# get all the grades available
+reports=[]
+
+# get all the year-stage-grade-course combinations 
 form_data=[]
 for year in years:
     year_form_data = {"fAnoEscolar":year}
     r.post(report_url, data=year_form_data, cookies=auth_cookie)
     for stage in stages:
-        stage_form_data = {"fTipoEns":stage}
+        stage_form_data = {"fTipoEns":stage['value']}
         stage_request= r.post(report_url, data=stage_form_data, cookies=auth_cookie)
         stage_web = BeautifulSoup(stage_request.content, "lxml")
         grades = stage_web.find("select", attrs={"id":"fGrado"}).findAll("option")
-        grades = [x['value'] for x in grades if x['value'] is not '']
+        grades = [x for x in grades if type(x) == bs4.element.Tag and x['value'] != '']
         for grade in grades:
-            stage_form_data['fGrado'] = grade
+            stage_form_data['fGrado'] = grade['value']
             grade_form_data = stage_form_data
             grade_request= r.post(report_url, data=grade_form_data, cookies=auth_cookie)
             grade_web = BeautifulSoup(grade_request.content, "lxml")
             courses = grade_web.find("select", attrs={"id":"fCurso"}).findAll("option")
-            courses = [x['value'] for x in courses if x['value'] is not '']
+            courses = [x for x in courses if type(x) == bs4.element.Tag and x['value'] != '']
             for course in courses:
-                form_data.append({"grade":grade, "stage":stage, "year":year, "course":course})
+                r.post(report_url, data={"fCurso":course['value']}, cookies=auth_cookie)
+                periods_response = r.post(report_url, data={"fAsignatura":"TODAS"}, cookies=auth_cookie)
+                periods_web = BeautifulSoup(periods_response.content)
+                periods = periods_web.find("select", attrs={"id":"fperiodos"})
+                if periods is None: 
+                    continue
+                periods = [x for x in periods if type(x) == bs4.element.Tag and x['value'] != 'TODAS' and x['value'] != '']
+                for period in periods:
+                    period_data = {"fNivel":"2", "fReligion":"3", "fAsignatura":"TODAS", "fperiodos":period['value'], "fDecimales":"1", "fMostrarRunAlumno":"1", "fAjustarnAsignatura":"1", "fMostrarProfAsig":"1"}
+                    period_response = r.post(report_url, data=period_data, cookies=auth_cookie)
+                    report_data =  get_report_data(period_response, {"grade":grade, "stage":stage, "year":year, "course":course, "period":period})
+                    reports.append(report_data)
+                
+reports = [y for x in reports for y in x]
+
+with open('grades.csv', 'w') as csvfile:
+    fieldnames=['grade', 'name', 'subject', 'year', 'run', 'stage', 'course', 'course_grade', 'period']
+    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    writer.writeheader()
+    for report in reports:
+        writer.writerow(report)
 
 
-# get the subjects and teachers
+# get the subjects and teachers 
 
-def get_report_data(response, year, form):
+def get_report_data(response, form):
     web_page = BeautifulSoup(response.content, "lxml")
     table = web_page.find("table", attrs={"class":"cuadriculaNotas"})
     subjects = []
@@ -133,37 +158,9 @@ def get_report_data(response, year, form):
         for index, grade in enumerate(td[3:-1], start=3):
             #cell.text.replace('&nbsp;', '')
             try:
-                db_row = {"name":name, "run":run, "subject":subjects[index].div.text, "grade":grade.text, "year":year}
+                db_row = {"name":name, "run":run, "subject":subjects[index].div.text, "grade":grade.text, "year":form['year'], "stage":form['stage'].text, "course":form['course'].text,  "course_grade":form['grade'].text, "period":form['period'].text}
                 grades.append(db_row)
             except AttributeError:
                 print("Subject number {} says {}".format(index, subjects[index]))
     return grades
-
-# filter courses with no grades HARCODED TO-DO
-form_data = [x for x in form_data if x['stage'] != '10' and x['year'] != '2016']
-reports=[]
-for form in form_data:
-    #step 1: select year and school
-    year_request_form_data = {"fAnoEscolar":form['year'], "fColegio":"9970"}
-    r.post(report_url, data=year_request_form_data, cookies=auth_cookie)
-    #step 2: select course
-    request_form_data = {"fTipoEns":form['stage'], "fGrado":form['grade'], "fCurso":form['course']}
-    r.post(report_url, data=request_form_data, cookies=auth_cookie)
-    # step 3: select asignatura
-    r.post(report_url, data={"fAsignatura":"TODAS"}, cookies=auth_cookie)
-    # step 4: 
-    report_response = r.post(report_url, data=report_form_data, cookies=auth_cookie)
-    report_data = get_report_data(report_response, form['year'], form)
-    reports.append(report_data)
-
-reports = [y for x in reports for y in x]
-
-with open('grades.csv', 'w') as csvfile:
-    fieldnames=['grade', 'name', 'subject', 'year', 'run']
-    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-    writer.writeheader()
-    for report in reports:
-        writer.writerow(report)
-
-
 
